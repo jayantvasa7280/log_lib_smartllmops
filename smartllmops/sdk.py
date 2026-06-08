@@ -565,7 +565,6 @@ class SDKTracer:
         start_time = int(time.time() * 1000)
 
         stack = _stack_var.get()
-        spans = _spans_var.get()
 
         effective_parent = parent_span_id or (stack[-1] if stack else None)
 

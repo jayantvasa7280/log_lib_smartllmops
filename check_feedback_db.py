@@ -1,7 +1,7 @@
 import time
 from azure.cosmos import CosmosClient
 import os
-import json
+
 from dotenv import load_dotenv
 import smartllmops
 
@@ -27,7 +27,7 @@ client = CosmosClient.from_connection_string(conn_str)
 db = client.get_database_client("llmops-data")
 container = db.get_container_client("user_feedback")
 
-print(f"Querying for feedback documents in 'user_feedback'...")
+print("Querying for feedback documents in 'user_feedback'...")
 items = list(container.query_items(
     query="SELECT * FROM c WHERE c.trace_id = 'trace-test-container'",
     enable_cross_partition_query=True

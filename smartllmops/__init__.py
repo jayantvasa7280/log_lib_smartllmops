@@ -52,7 +52,6 @@ def init(
         provider=provider,
         tags=tags,
         api_key=api_key,
-        framework=framework,
     )
 
     # LangSmith-style: Auto-patch OpenAI if requested via env var
