@@ -3,8 +3,7 @@ import time
 import functools
 import inspect
 import os
-from typing import Dict, Any, Optional
-from .streamlit_patch import patch_streamlit
+from typing import Dict, Any
 from contextvars import ContextVar
 
 
@@ -12,68 +11,6 @@ from contextvars import ContextVar
 _spans_var: ContextVar[list] = ContextVar("spans", default=[])
 _stack_var: ContextVar[list] = ContextVar("active_span_stack", default=[])
 _trace_id_var: ContextVar[str] = ContextVar("trace_id", default=None)
-
-
-import threading
-import collections
-
-_global_lock = threading.Lock()
-_global_session_traces: Dict[str, str] = {}  # session_id -> trace_id
-_global_trace_spans: Dict[str, list] = collections.defaultdict(list)  # trace_id -> spans
-_global_trace_stacks: Dict[str, list] = collections.defaultdict(list)  # trace_id -> stack
-_global_in_flight_spans: Dict[str, dict] = collections.defaultdict(dict)  # trace_id -> {span_id -> span_info}
-
-
-def _extract_session_id(args, kwargs) -> str:
-    def check_value(val, depth=0):
-        if depth > 3 or not val:
-            return None
-        
-        # 1. If it's a dict, inspect keys and recurse
-        if isinstance(val, dict):
-            # Check configurable or shallow keys
-            for key in ["configurable", "config"]:
-                if key in val:
-                    res = check_value(val[key], depth + 1)
-                    if res:
-                        return res
-            for key in ["thread_id", "session_id", "run_id"]:
-                if val.get(key):
-                    return str(val[key])
-            # Recurse deep into dictionary values if not found
-            for k, v in val.items():
-                if k not in ["configurable", "config"]:
-                    res = check_value(v, depth + 1)
-                    if res:
-                        return res
-        
-        # 2. If it's an object with attributes
-        else:
-            try:
-                for attr in ["configurable", "config"]:
-                    if hasattr(val, attr):
-                        res = check_value(getattr(val, attr), depth + 1)
-                        if res:
-                            return res
-                for attr in ["thread_id", "session_id", "run_id"]:
-                    if hasattr(val, attr):
-                        v = getattr(val, attr)
-                        if v:
-                            return str(v)
-            except Exception:
-                pass
-        return None
-
-    # Scan kwargs and args
-    for val in kwargs.values():
-        res = check_value(val)
-        if res:
-            return res
-    for arg in args:
-        res = check_value(arg)
-        if res:
-            return res
-    return None
 
 
 class SDKTracer:
@@ -99,79 +36,27 @@ class SDKTracer:
         self.tags = tags or {}
         self.model = model or "unknown"
         self.provider = provider or "unknown"
-        self.framework = framework or "unknown"
-        try:
-            patch_streamlit(self)
-        except Exception:
-            pass
         self.api_key = api_key
+        self.framework = framework or "unknown"
         self.enrichers = {
             "llm": self._enrich_llm,
             "retrieval": self._enrich_retrieval,
             "tool": self._enrich_tool,
             "planner": self._enrich_planner,
             "intent-classification": self._enrich_intent,
-            "query-rewrite": self._enrich_query_rewrite,
             "chain": self._enrich_chain,
             "agent": self._enrich_agent,
         }
-
-    def _map_observation_type(self, span_type: str) -> str:
-        mapping = {
-            "llm": "GENERATION",
-            "chat-completion": "GENERATION",
-
-            "retrieval": "RETRIEVER",
-            "vector-search": "RETRIEVER",
-
-            "tool": "TOOL",
-            "api-call": "TOOL",
-            "sql-query": "TOOL",
-
-            "planner": "AGENT",
-            "router": "AGENT",
-            "tool-selection": "AGENT",
-            "agent": "AGENT",
-
-            "intent-classification": "CHAIN",
-            "query-rewrite": "CHAIN",
-            "chain": "CHAIN",
-            "workflow": "CHAIN",
-
-            "embedding": "EMBEDDING",
-
-            "evaluation": "EVALUATOR",
-
-            "guardrail": "GUARDRAIL",
-
-            "event": "EVENT",
-        }
-        return mapping.get((span_type or "").lower(), "SPAN")
 
     # ---------------------------------------------------------
     # TRACE INITIALIZATION
     # ---------------------------------------------------------
 
-    def start_trace(self, root_name="AI Workflow", root_type="workflow", force=False):
-        if _trace_id_var.get() and not force:
-            return  # Trace already active, prevent accidental reset
-            
-        trace_id = f"trace-{uuid.uuid4().hex[:6]}"
-        root_span_id = f"span-{uuid.uuid4().hex[:6]}"
-        
-        _spans_var.set([])  # Do not add to completed spans yet
-        _stack_var.set([root_span_id])
+    def start_trace(self):
+        _spans_var.set([])
+        _stack_var.set([])
+        trace_id = f"trace-{uuid.uuid4().hex[:8]}"
         _trace_id_var.set(trace_id)
-        
-        with _global_lock:
-            _global_trace_spans[trace_id] = []
-            _global_trace_stacks[trace_id] = [root_span_id]
-            _global_in_flight_spans[trace_id][root_span_id] = {
-                "name": root_name,
-                "start_time": int(time.time() * 1000),
-                "parent_span_id": None,
-                "span_type": root_type
-            }
 
     # ---------------------------------------------------------
     # USAGE NORMALIZATION
@@ -202,7 +87,7 @@ class SDKTracer:
                 break
 
         # Standard (OpenAI/Groq style)
-        if "prompt_tokens" in usage or "completion_tokens" in usage or ("total_tokens" in usage and "input_tokens" not in usage):
+        if "prompt_tokens" in usage or "completion_tokens" in usage or "total_tokens" in usage:
             prompt = int(usage.get("prompt_tokens", 0) or 0)
             completion = int(usage.get("completion_tokens", 0) or 0)
             total = int(usage.get("total_tokens", prompt + completion))
@@ -237,53 +122,6 @@ class SDKTracer:
         #Fallback for unknown formats
         return {}
 
-    def _find_usage_in_object(self, obj, depth=0):
-        if depth > 6 or obj is None:
-            return None
-        
-        # 1. Direct usage attributes
-        if isinstance(obj, dict):
-            for key in ["usage", "token_usage", "usage_metadata"]:
-                if key in obj and obj[key]:
-                    return obj[key]
-            # Langchain response metadata
-            if "response_metadata" in obj and isinstance(obj["response_metadata"], dict):
-                if "token_usage" in obj["response_metadata"]:
-                    return obj["response_metadata"]["token_usage"]
-        elif hasattr(obj, "usage_metadata") and obj.usage_metadata:
-            return obj.usage_metadata
-        elif hasattr(obj, "response_metadata") and isinstance(obj.response_metadata, dict):
-            if "token_usage" in obj.response_metadata:
-                return obj.response_metadata["token_usage"]
-        elif hasattr(obj, "usage") and obj.usage:
-            return obj.usage
-            
-        # 2. Recurse into structures
-        if isinstance(obj, dict):
-            for v in obj.values():
-                res = self._find_usage_in_object(v, depth + 1)
-                if res: return res
-        elif isinstance(obj, (list, tuple)):
-            for v in obj:
-                res = self._find_usage_in_object(v, depth + 1)
-                if res: return res
-        else:
-            # LangGraph Command object
-            if hasattr(obj, "update") and obj.update:
-                res = self._find_usage_in_object(obj.update, depth + 1)
-                if res: return res
-            
-            # Pydantic or dataclass fallback
-            try:
-                if hasattr(obj, "__dict__"):
-                    for v in obj.__dict__.values():
-                        res = self._find_usage_in_object(v, depth + 1)
-                        if res: return res
-            except:
-                pass
-                
-        return None
-
     def _generic_parse(self, output, args, kwargs, span_type, include_io=True):
         metadata = {}
         usage = {}
@@ -312,15 +150,18 @@ class SDKTracer:
             "step_number",
             "iteration",
             "tool_name",
-            "agent_name",
         ]
         for param in common_params:
             if param in kwargs:
                 metadata[param] = kwargs[param]
 
         # 3. Token Usage Heuristics
-        # Deeply inspect the output object to find usage metadata
-        raw_usage = self._find_usage_in_object(output)
+        # Look for usage in output (if it's a dict or has a usage attribute)
+        raw_usage = None
+        if isinstance(output, dict):
+            raw_usage = output.get("usage") or output.get("token_usage") or output.get("usage_metadata")
+        elif hasattr(output, "usage"):
+            raw_usage = output.usage
 
         if raw_usage:
             normalized = self._normalize_usage(raw_usage)
@@ -417,7 +258,7 @@ class SDKTracer:
                 for item in safe_docs:
                     # In case of (doc, score) or just doc
                     doc = item[0] if isinstance(item, (list, tuple)) else item
-                    docs_metadata.append({"content_preview": getattr(doc, "page_content", getattr(doc, "text", getattr(doc, "content", str(doc))))})
+                    docs_metadata.append({"content_preview": getattr(doc, "page_content", str(doc))})
             metadata["documents"] = docs_metadata
             
             metadata["scores"] = [
@@ -461,13 +302,6 @@ class SDKTracer:
                 metadata["_provider_raw_usage"] = output[1]
 
         return {"metadata": metadata, "usage": usage}
-
-    def _enrich_query_rewrite(self, output, args, kwargs):
-        return {
-            "metadata": {
-                "rewritten_query": output
-            }
-        }
 
     def _enrich_chain(self, output, args, kwargs):
         return {
@@ -543,23 +377,11 @@ class SDKTracer:
     # SPAN EXECUTION CORE
     # ---------------------------------------------------------
 
-    def _before_span(self, func, name, parent_span_id, session_id=None, span_type=None):
-
-        if session_id:
-            with _global_lock:
-                if session_id in _global_session_traces:
-                    trace_id = _global_session_traces[session_id]
-                    _trace_id_var.set(trace_id)
-                    _spans_var.set(list(_global_trace_spans.get(trace_id, [])))
-                    _stack_var.set(list(_global_trace_stacks.get(trace_id, [])))
+    def _before_span(self, func, name, parent_span_id):
 
         if not _trace_id_var.get():
             self.start_trace()
-            if session_id:
-                with _global_lock:
-                    _global_session_traces[session_id] = _trace_id_var.get()
 
-        trace_id = _trace_id_var.get()
         span_name = name or func.__name__
         span_id = f"span-{uuid.uuid4().hex[:8]}"
         start_time = int(time.time() * 1000)
@@ -571,15 +393,6 @@ class SDKTracer:
 
         stack = stack + [span_id]
         _stack_var.set(stack)
-
-        if trace_id:
-            with _global_lock:
-                _global_in_flight_spans[trace_id][span_id] = {
-                    "name": span_name,
-                    "start_time": start_time,
-                    "parent_span_id": effective_parent,
-                    "span_type": span_type or "generic"
-                }
 
         return span_id, span_name, start_time, effective_parent
 
@@ -599,7 +412,6 @@ class SDKTracer:
         kwargs,
         error_metadata,
         span_type,
-        session_id=None,
     ):
 
         stack = _stack_var.get()
@@ -612,21 +424,9 @@ class SDKTracer:
         end_time = int(time.time() * 1000)
         trace_id = _trace_id_var.get()
 
-        if trace_id:
-            with _global_lock:
-                if trace_id in _global_in_flight_spans:
-                    _global_in_flight_spans[trace_id].pop(span_id, None)
-
-        end_time = int(time.time() * 1000)
-        trace_id = _trace_id_var.get()
-
         final_metadata = (metadata or {}).copy()
         final_usage = (usage or {}).copy()
         final_metadata.update(error_metadata or {})
-
-        # Normalize legacy types
-        if span_type == "chain":
-            span_type = "query-rewrite"
 
         # --- SMART DECLARATIVE PARSING ---
         if status == "success":
@@ -666,26 +466,6 @@ class SDKTracer:
                     except Exception as e:
                         final_metadata["_enricher_error"] = str(e)
 
-        # --- SEMANTIC METADATA CONVENTIONS ---
-        canonical_type = self._map_observation_type(span_type)
-        final_metadata["smartllmops.observation.type"] = canonical_type
-        final_metadata["smartllmops.subtype"] = span_type or "generic"
-
-        if canonical_type == "GENERATION":
-            final_metadata["gen_ai.operation.name"] = "chat"
-        elif canonical_type == "RETRIEVER":
-            final_metadata["gen_ai.operation.name"] = "retrieve"
-        elif canonical_type == "TOOL":
-            final_metadata["gen_ai.tool.name"] = final_metadata.get("tool_name") or span_name
-        elif canonical_type == "AGENT":
-            final_metadata["gen_ai.agent.name"] = final_metadata.get("agent_name") or span_name
-
-        # Add workflow metadata if available
-        if "step_number" in final_metadata:
-            final_metadata["workflow.step"] = final_metadata["step_number"]
-        if "iteration" in final_metadata:
-            final_metadata["workflow.iteration"] = final_metadata["iteration"]
-
         # --- LAZY SPAN NAMING ---
         final_span_name = span_name
         if "{provider}" in final_span_name:
@@ -697,8 +477,7 @@ class SDKTracer:
             "span_id": span_id,
             "parent_span_id": effective_parent,
             "sequence": len(spans) + 1,
-            "observation_type": canonical_type,
-            "subtype": span_type or "generic",
+            "type": span_type or "generic",
             "name": final_span_name,
             "start_time": start_time,
             "end_time": end_time,
@@ -708,22 +487,8 @@ class SDKTracer:
             "usage": final_usage,
         }
 
-        # Prevent duplicate spans safely
-        if not any(s.get("span_id") == span["span_id"] for s in spans):
-            spans.append(span)
-
+        spans.append(span)
         _spans_var.set(spans)
-
-        trace_id_now = _trace_id_var.get()
-        if trace_id_now:
-            with _global_lock:
-                # Merge spans in global list to protect against concurrent task race conditions
-                existing = _global_trace_spans.get(trace_id_now, [])
-                for s in spans:
-                    if not any(x["span_id"] == s["span_id"] for x in existing):
-                        existing.append(s)
-                _global_trace_spans[trace_id_now] = existing
-                _global_trace_stacks[trace_id_now] = stack
 
     # ---------------------------------------------------------
     # SPAN EXECUTION
@@ -746,12 +511,11 @@ class SDKTracer:
         
         # Auto-extract parameters from kwargs to metadata
         meta_dict = metadata or {}
-        session_id = _extract_session_id(args, kwargs)
 
         if is_async:
 
             async def wrapper():
-                span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id, session_id=session_id, span_type=span_type)
+                span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id)
                 status = "success"
                 output = None
                 error_meta = {}
@@ -770,14 +534,14 @@ class SDKTracer:
                     self._after_span(
                         span_id, span_name, start_time, parent, status, output,
                         meta_dict, usage, include_io, result_parser, args, kwargs,
-                        error_meta, span_type, session_id=session_id
+                        error_meta, span_type
                     )
 
             return wrapper()
 
         else:
 
-            span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id, session_id=session_id, span_type=span_type)
+            span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id)
             status = "success"
             output = None
             error_meta = {}
@@ -796,7 +560,7 @@ class SDKTracer:
                 self._after_span(
                     span_id, span_name, start_time, parent, status, output,
                     meta_dict, usage, include_io, result_parser, args, kwargs,
-                    error_meta, span_type, session_id=session_id
+                    error_meta, span_type
                 )
 
     # ---------------------------------------------------------
@@ -856,56 +620,8 @@ class SDKTracer:
         rag_docs=None,
     ):
 
+        spans = _spans_var.get()
         trace_id = _trace_id_var.get() or f"trace-{uuid.uuid4().hex[:8]}"
-        spans = []
-        if session_id:
-            with _global_lock:
-                t_id = _global_session_traces.get(session_id)
-                if t_id:
-                    trace_id = t_id
-                    spans = _global_trace_spans.get(t_id, [])
-        
-        if not spans:
-            spans = list(_spans_var.get())
-
-        # Dynamic stitch/flush of any active in-flight spans (e.g. final report generation span)
-        if trace_id:
-            with _global_lock:
-                in_flight = _global_in_flight_spans.get(trace_id, {})
-                for span_id, info in list(in_flight.items()):
-                    if not any(s.get("span_id") == span_id for s in spans):
-                        span_name = info["name"]
-                        start_time = info["start_time"]
-                        parent = info["parent_span_id"]
-                        stype = info["span_type"]
-                        end_time = int(time.time() * 1000)
-                        
-                        # Dynamically parse outputs and usage from the final trace export payload
-                        parsed = self._generic_parse(output, (), {}, stype, include_io=True)
-                        final_metadata = parsed.get("metadata", {}).copy()
-                        final_usage = parsed.get("usage", {}).copy()
-                        
-                        canonical_type = self._map_observation_type(stype)
-                        final_metadata["smartllmops.observation.type"] = canonical_type
-                        final_metadata["smartllmops.subtype"] = stype or "generic"
-                        
-                        span = {
-                            "trace_id": trace_id,
-                            "span_id": span_id,
-                            "parent_span_id": parent,
-                            "sequence": len(spans) + 1,
-                            "observation_type": canonical_type,
-                            "subtype": stype or "generic",
-                            "name": span_name,
-                            "start_time": start_time,
-                            "end_time": end_time,
-                            "latency_ms": max(end_time - start_time, 0),
-                            "status": "success",
-                            "metadata": final_metadata,
-                            "usage": final_usage,
-                        }
-                        spans.append(span)
-                        _global_in_flight_spans[trace_id].pop(span_id, None)
 
         # Aggregation Logic
         detected_provider = self.provider
@@ -924,7 +640,7 @@ class SDKTracer:
                 total_usage["total_tokens"] += span_usage.get("total_tokens", 0)
 
             # 2. Capture dynamic provider/model from span metadata (prefer LLM spans)
-            if span.get("subtype") == "llm" or span["metadata"].get("_provider_detected"):
+            if span["type"] == "llm" or span["metadata"].get("_provider_detected"):
                 if span["metadata"].get("_provider_detected"):
                     detected_provider = span["metadata"]["_provider_detected"]
                 
@@ -932,7 +648,7 @@ class SDKTracer:
                 if real_model:
                     detected_model = real_model
                 
-                if span.get("subtype") == "llm":
+                if span["type"] == "llm":
                     llm_span_count += 1
 
             # 3. Merge raw usage details (from any span with raw data)
@@ -950,7 +666,7 @@ class SDKTracer:
                         provider_raw_sum[k] = provider_raw_sum.get(k, 0) + v
             
             # 2. Extract rag_docs if not manually provided
-            if span.get("subtype") == "retrieval" and not detected_rag_docs:
+            if span["type"] == "retrieval" and not detected_rag_docs:
                 docs = span["metadata"].get("documents", [])
                 scores = span["metadata"].get("scores", [])
                 if docs and scores:
@@ -962,29 +678,7 @@ class SDKTracer:
             end = max(s["end_time"] for s in spans)
             latency = end - start
 
-        # Robust dictionary parsing (MANDATORY)
-        answer = None
-        if isinstance(output, dict):
-            for key in ["output", "final_report", "answer", "response", "result"]:
-                if key in output:
-                    answer = output[key]
-                    break
-            
-            if answer is None and "messages" in output:
-                msgs = output["messages"]
-                if msgs:
-                    last_msg = msgs[-1]
-                    if hasattr(last_msg, "content"):
-                        answer = last_msg.content
-                    elif isinstance(last_msg, dict) and "content" in last_msg:
-                        answer = last_msg["content"]
-                    else:
-                        answer = str(last_msg)
-            
-            if answer is None:
-                answer = output
-        else:
-            answer = output
+        answer = output.get("output") if isinstance(output, dict) else output
 
         trace_status = (
             "error"
@@ -1023,66 +717,8 @@ class SDKTracer:
         _stack_var.set([])
         _trace_id_var.set(None)
 
-        # Log trace first
         self.telemetry.log_trace(trace)
-
-        # Automatically store trace_id in Streamlit session state if running inside Streamlit
-        try:
-            import streamlit as st
-            if "_smartllmops_traces" not in st.session_state:
-                st.session_state._smartllmops_traces = []
-            
-            # Avoid duplicate trace entries
-            if not any(t.get("trace_id") == trace_id for t in st.session_state._smartllmops_traces):
-                st.session_state._smartllmops_traces.append({
-                    "trace_id": trace_id,
-                    "session_id": session_id,
-                    "user_id": user_id
-                })
-        except Exception:
-            pass
-
-        # Cleanup Registry ONLY after successful logging to prevent memory leaks (MANDATORY)
-        if session_id:
-            with _global_lock:
-                _global_session_traces.pop(session_id, None)
-                _global_trace_spans.pop(trace_id, None)
-                _global_trace_stacks.pop(trace_id, None)
-                _global_in_flight_spans.pop(trace_id, None)
-
         return trace
-
-    def log_feedback(
-        self,
-        trace_id: str,
-        thumb: Optional[str] = None,
-        retry_clicked: Optional[bool] = None,
-        output_copied: Optional[bool] = None,
-        session_id: Optional[str] = None,
-        user_id: Optional[str] = None
-    ):
-        """
-        Public telemetry method to submit user feedback parameters (thumb, retry, copy).
-        Works asynchronously and decoupled in any Python LLM application (FastAPI, Flask, etc.).
-        """
-        try:
-            feedback_doc = {
-                "id": f"feedback-{trace_id}",
-                "trace_id": trace_id,
-                "session_id": session_id or "session-unknown",
-                "user_id": user_id or "user-unknown",
-                "thumb": thumb,
-                "retry_clicked": retry_clicked,
-                "output_copied": output_copied,
-                "type": "feedback",
-                "timestamp": int(time.time() * 1000),
-                "partitionKey": trace_id
-            }
-            self.telemetry.log_trace(feedback_doc)
-            return True
-        except Exception as e:
-            print(f"smartllmops: Failed to log feedback: {e}")
-            return False
 
     # ---------------------------------------------------------
     # AUTO-INSTRUMENTATION (LangSmith-style)
