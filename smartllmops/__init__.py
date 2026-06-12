@@ -17,6 +17,8 @@ def init(
     container_name=None,
     application_name=None,
     app_name=None,          # alias for application_name
+    app_id=None,            # new parameter for Multi-Tenancy
+    application_id=None,    # alias for app_id
     environment="prod",
     model=None,
     provider=None,
@@ -26,8 +28,9 @@ def init(
 ):
     """Initializes and returns a tracer instance with optional auto-patching."""
 
-    # app_name is a friendlier alias for application_name
+    # Resolve app_id and application_name aliases
     resolved_app_name = application_name or app_name
+    resolved_app_id = app_id or application_id
 
     # Auto-load from environment if not provided
     cosmos_conn     = cosmos_conn     or os.getenv("COSMOS_CONN_WRITE")
@@ -45,6 +48,7 @@ def init(
 
     tracer = SDKTracer(
         telemetry,
+        app_id=resolved_app_id,
         application_name=resolved_app_name,
         environment=environment,
         framework=framework,

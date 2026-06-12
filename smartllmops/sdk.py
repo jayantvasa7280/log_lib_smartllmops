@@ -81,6 +81,7 @@ class SDKTracer:
     def __init__(
         self,
         telemetry,
+        app_id=None,
         application_name=None,
         environment="prod",
         model=None,
@@ -90,10 +91,18 @@ class SDKTracer:
         framework=None
     ):
         self.telemetry = telemetry
+        # Resolve app_id with fallback priority
+        self.app_id = (
+            app_id
+            or os.getenv("SMART_LLMOPS_APP_ID")
+            or application_name
+            or os.getenv("SMART_LLMOPS_APP")
+            or "default-app"
+        )
         self.application_name = (
             application_name
             or os.getenv("SMART_LLMOPS_APP")
-            or "default-app"
+            or self.app_id
         )
         self.environment = environment
         self.tags = tags or {}
@@ -1000,6 +1009,7 @@ class SDKTracer:
             "timestamp": timestamp or int(time.time() * 1000),
 
             # 🔥 ADD THESE
+            "app_id": self.app_id,
             "application_name": self.application_name,
             "tags": self.tags,
 
@@ -1068,6 +1078,7 @@ class SDKTracer:
             feedback_doc = {
                 "id": f"feedback-{trace_id}",
                 "trace_id": trace_id,
+                "app_id": self.app_id,
                 "session_id": session_id or "session-unknown",
                 "user_id": user_id or "user-unknown",
                 "thumb": thumb,

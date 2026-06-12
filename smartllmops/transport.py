@@ -143,6 +143,10 @@ class Telemetry:
     def log_trace(self, trace: dict):
         """Add trace to async queue for processing."""
         try:
+            # Ensure app_id exists in trace payload
+            if "app_id" not in trace or not trace["app_id"]:
+                trace["app_id"] = trace.get("application_name") or "default-app"
+
             # Ensure ID exists
             if "id" not in trace and "trace_id" in trace:
                 trace["id"] = trace["trace_id"]
